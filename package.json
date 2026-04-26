@@ -1,0 +1,18 @@
+{
+  "name": "neurafeed-mcp",
+  "version": "1.0.1",
+  "description": "MCP server for NeuraFeed - plug live AI-generated news into any AI agent",
+  "type": "module",
+  "bin": {
+    "neurafeed-mcp": "./bin/neurafeed-mcp"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "zod": "^3"
+  },
+  "keywords": ["mcp", "news", "ai", "neurafeed", "model-context-protocol"],
+  "license": "MIT"
+}
