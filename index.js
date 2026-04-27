@@ -1,11 +1,14 @@
+#!/usr/bin/env node
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { execSync } from 'child_process';
 
 const BASE_URL = 'https://feed.neuraspheres.com';
+const MCP_URL = `${BASE_URL}/api/mcp`;
 const args = process.argv.slice(2);
 
 if (args[0] === 'install') {
@@ -69,81 +72,152 @@ async function install() {
   const plat = process.platform;
   const appdata = process.env.APPDATA ?? path.join(home, 'AppData', 'Roaming');
 
-  const clients = [
-    {
-      name: 'Claude Desktop',
-      configPath:
-        plat === 'darwin'
-          ? path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json')
-          : plat === 'win32'
-          ? path.join(appdata, 'Claude', 'claude_desktop_config.json')
-          : null,
-      entry: { url: `${BASE_URL}/api/mcp` },
-    },
-    {
-      name: 'Claude Code',
-      configPath: path.join(home, '.claude', 'mcp.json'),
-      entry: { type: 'http', url: `${BASE_URL}/api/mcp` },
-    },
-    {
-      name: 'Cursor',
-      configPath: path.join(home, '.cursor', 'mcp.json'),
-      entry: { url: `${BASE_URL}/api/mcp` },
-    },
-  ];
-
   console.log('Installing NeuraFeed MCP server...\n');
+
+  // Step 1: global npm install so the binary is in PATH
+  ensureGlobalInstall();
 
   let found = 0;
 
-  for (const client of clients) {
-    if (!client.configPath) continue;
+  // Step 2: Claude Code — must use the `claude mcp add` CLI (writes to ~/.claude.json)
+  if (registerClaudeCode()) found++;
 
-    const dir = path.dirname(client.configPath);
-    const dirExists = fs.existsSync(dir);
-    const fileExists = fs.existsSync(client.configPath);
-
-    // Skip clients that are not installed on this machine
-    if (!dirExists && !fileExists) continue;
-
+  // Step 3: Claude Desktop
+  const claudeDesktopPath =
+    plat === 'darwin'
+      ? path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json')
+      : plat === 'win32'
+      ? path.join(appdata, 'Claude', 'claude_desktop_config.json')
+      : null;
+  if (claudeDesktopPath && patchJsonConfig('Claude Desktop', claudeDesktopPath, ['mcpServers'], { url: MCP_URL })) {
     found++;
-
-    let config = { mcpServers: {} };
-
-    if (fileExists) {
-      try {
-        const raw = fs.readFileSync(client.configPath, 'utf8');
-        config = JSON.parse(raw);
-      } catch {
-        console.error(`  x ${client.name}: could not parse existing config, skipping`);
-        continue;
-      }
-    }
-
-    if (!config.mcpServers) config.mcpServers = {};
-    config.mcpServers.neurafeed = client.entry;
-
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(client.configPath, JSON.stringify(config, null, 2) + '\n');
-      const action = fileExists ? 'updated' : 'created';
-      console.log(`  + ${client.name}: ${action} ${client.configPath}`);
-    } catch (err) {
-      console.error(`  x ${client.name}: ${err.message}`);
-    }
   }
+
+  // Step 4: Cursor (~/.cursor/mcp.json)
+  if (patchJsonConfig('Cursor', path.join(home, '.cursor', 'mcp.json'), ['mcpServers'], { url: MCP_URL })) {
+    found++;
+  }
+
+  // Step 5: VS Code (user settings.json — mcp.servers key, VS Code 1.99+)
+  const vscodePath =
+    plat === 'win32'
+      ? path.join(appdata, 'Code', 'User', 'settings.json')
+      : plat === 'darwin'
+      ? path.join(home, 'Library', 'Application Support', 'Code', 'User', 'settings.json')
+      : path.join(home, '.config', 'Code', 'User', 'settings.json');
+  if (patchJsonConfig('VS Code', vscodePath, ['mcp', 'servers'], { type: 'http', url: MCP_URL })) {
+    found++;
+  }
+
+  // Cleanup: remove the old incorrect ~/.claude/mcp.json entry (Claude Code ignores that file)
+  cleanupLegacyMcpJson(path.join(home, '.claude', 'mcp.json'));
 
   console.log('');
 
   if (found === 0) {
     console.log('No supported MCP clients detected on this machine.');
     console.log('');
-    console.log('Supported clients: Claude Desktop, Claude Code, Cursor');
+    console.log('Supported clients: Claude Code, Claude Desktop, Cursor, VS Code');
     console.log('');
-    console.log('Add it manually by pasting this into your client\'s MCP config:');
+    console.log('Add it manually to your MCP config:');
     console.log('');
-    console.log(JSON.stringify({ mcpServers: { neurafeed: { url: `${BASE_URL}/api/mcp` } } }, null, 2));
+    console.log(JSON.stringify({ neurafeed: { url: MCP_URL } }, null, 2));
   } else {
     console.log('Done. Restart your client to load the new server.');
   }
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+function ensureGlobalInstall() {
+  try {
+    const globalRoot = execSync('npm root -g', { encoding: 'utf8', stdio: 'pipe' }).trim();
+    if (fs.existsSync(path.join(globalRoot, 'neurafeed-mcp'))) {
+      console.log('  ✓ neurafeed-mcp already globally installed (in PATH)\n');
+      return;
+    }
+    process.stdout.write('  Installing neurafeed-mcp globally (adds to PATH)... ');
+    execSync('npm install -g neurafeed-mcp', { stdio: 'pipe' });
+    console.log('done');
+    console.log('  ✓ neurafeed-mcp is now in PATH\n');
+  } catch {
+    console.log('  ! Could not install globally — run: npm install -g neurafeed-mcp\n');
+  }
+}
+
+function registerClaudeCode() {
+  try {
+    execSync('claude --version', { stdio: 'pipe' });
+  } catch {
+    // claude CLI not installed on this machine
+    return false;
+  }
+  try {
+    execSync(`claude mcp add --transport http --scope user neurafeed "${MCP_URL}"`, { stdio: 'pipe' });
+    console.log('  + Claude Code: registered');
+    return true;
+  } catch (err) {
+    const msg = String(err.stderr ?? err.message ?? '');
+    // "already exists" or "already registered" means it was set up previously — treat as success
+    if (/already|exists/i.test(msg)) {
+      console.log('  ✓ Claude Code: already registered');
+      return true;
+    }
+    console.error(`  x Claude Code: ${msg.trim() || 'unknown error'}`);
+    return false;
+  }
+}
+
+// Merges { [keyPath]: { neurafeed: entry } } into a JSON config file.
+// keyPath is an array of nested keys, e.g. ['mcpServers'] or ['mcp', 'servers'].
+// Skips silently if the client directory does not exist (client not installed).
+function patchJsonConfig(name, configPath, keyPath, entry) {
+  const dir = path.dirname(configPath);
+  const fileExists = fs.existsSync(configPath);
+  if (!fs.existsSync(dir) && !fileExists) return false;
+
+  let config = {};
+  if (fileExists) {
+    try {
+      config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    } catch {
+      console.error(`  x ${name}: could not parse existing config, skipping`);
+      return false;
+    }
+  }
+
+  // Walk / create the nested key path
+  let obj = config;
+  for (let i = 0; i < keyPath.length - 1; i++) {
+    if (typeof obj[keyPath[i]] !== 'object' || obj[keyPath[i]] === null) {
+      obj[keyPath[i]] = {};
+    }
+    obj = obj[keyPath[i]];
+  }
+  const last = keyPath[keyPath.length - 1];
+  if (typeof obj[last] !== 'object' || obj[last] === null) obj[last] = {};
+  obj[last].neurafeed = entry;
+
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+    console.log(`  + ${name}: ${fileExists ? 'updated' : 'created'} ${configPath}`);
+    return true;
+  } catch (err) {
+    console.error(`  x ${name}: ${err.message}`);
+    return false;
+  }
+}
+
+// Removes the neurafeed entry from the old ~/.claude/mcp.json file (which Claude
+// Code never actually reads — it uses ~/.claude.json via `claude mcp add`).
+function cleanupLegacyMcpJson(mcpJsonPath) {
+  if (!fs.existsSync(mcpJsonPath)) return;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(mcpJsonPath, 'utf8'));
+    if (!cfg.mcpServers?.neurafeed) return;
+    delete cfg.mcpServers.neurafeed;
+    if (Object.keys(cfg.mcpServers).length === 0) delete cfg.mcpServers;
+    fs.writeFileSync(mcpJsonPath, JSON.stringify(cfg, null, 2) + '\n');
+  } catch { /* ignore */ }
 }

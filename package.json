@@ -1,10 +1,10 @@
 {
   "name": "neurafeed-mcp",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "MCP server for NeuraFeed - plug live AI-generated news into any AI agent",
   "type": "module",
   "bin": {
-    "neurafeed-mcp": "./bin/neurafeed-mcp"
+    "neurafeed-mcp": "./index.js"
   },
   "engines": {
     "node": ">=18"
